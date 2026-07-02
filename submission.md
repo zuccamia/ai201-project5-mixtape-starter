@@ -1,8 +1,38 @@
+## AI Usage
+
+I used Claude Code (Opus 4.7) as a pair-programming assistant. My pattern was *ask, verify, decide*: I asked the AI, then ran the code myself before trusting the answer.
+
+### What I asked the AI to explain, trace, or summarize
+
+- Trace the data flows through `routes/` and `services/`.
+- Convert those flows into horizontal ASCII diagrams.
+- Summarize the role of each file in `routes/` and `services/`.
+- Explain unfamiliar SQLAlchemy behavior: legacy `Query` vs modern `select()`, when `.unique()` is needed, how `lazy="subquery"` works, and how to count queries with `before_cursor_execute`.
+- Draft Flask-shell reproduction scripts for Issues #2 and #4.
+- Draft the four subsections of each Root Cause Analysis entry after I understood the mechanism.
+
+### What the AI helped me understand
+
+- Legacy `Query.all()` deduplicates ORM entities implicitly. Modern `select().execute().scalars().all()` does not. That was the key insight behind Issue #3.
+- `lazy="subquery"` batches related-object loads into one extra SELECT. Search is always 2 queries, never N+1. This shaped the regression test in `tests/test_search.py`.
+- SQLAlchemy `before_cursor_execute` events can be used inside a pytest to assert query counts.
+
+### Where I had to correct or verify the AI
+
+- **Issue #2, twice.** First it suggested shortening the 24h threshold to 30 minutes. I told it 24 hours was correct. Then it swung the other way and said there was no bug. I had to explain the actual fix: a dynamic midnight-of-today cutoff.
+- **Issue #3 initial reproduction was wrong.** The AI confidently described the multi-tag test failing with 3 duplicates. I ran `pytest tests/test_search.py`, all 5 tests passed. Only then did the AI verify and walk it back.
+- **My outerjoin hypothesis was wrong.** I said the `outerjoin(song_tags, ...)` was needed to load tag data. The AI verified against the DB that tags flow through the `Song.tags` relationship, not the join. Empirical check corrected my assumption.
+- **Reproducing Issue #1 outside the test.** The AI first suggested a `freeze_time` HTTP setup for Issue #1. I asked how that differed from the existing test. It over-emphasized environment differences before agreeing the underlying principle was the same.
+
+### Practical takeaway
+
+The AI is fast at reading unfamiliar SQLAlchemy behavior and at drafting documentation prose. It also confidently produces plausible-sounding explanations that do not survive contact with real code. Every time I actually ran the tests, called the endpoint, or read the SQL log, I caught something the AI had gotten wrong or overstated. My rule: use the AI for orientation and prose, treat every behavioral claim as a hypothesis to verify.
+
 ## Codebase Map
 `models.py` defines 7 SQLAlchemy models: `User`, `Tag`, `Song`, `ListeningEvent`, `Rating`, `Playlist`, `Notification`.
 - The `friendships` table is a join table that represents the relationships between many users to many users.
 - The `song_tags` table is a join table that joins songs with multiple tags.
-- The `playlist_entries` table is a join table that adds a `position` column, a song entry in a playlist has its own position, not just insertion order.
+- The `playlist_entries` table is a join table with an extra `position` column. Each song in a playlist has its own position, not just insertion order.
 
 `routes/` — thin Flask blueprints, one per resource; each route parses/validates request input, delegates to a service, and shapes the JSON response:
 - `feed.py` — feed endpoints: `/<user_id>/listening-now`, `/<user_id>/activity`.
@@ -62,30 +92,30 @@ POST /songs/<id>/listen {user_id} ─▶ streak_service.record_listening_event(u
 
 ### Issue #1 — My listening streak keeps resetting
 
-**How I reproduced it.** Ran `pytest tests/test_streaks.py`. `test_streak_increments_on_sunday` failed: a Saturday listen followed by a Sunday listen left the streak at `1` instead of `2`. I did not reproduce it live via `POST /songs/<id>/listen`, since the endpoint calls `datetime.now()` internally, so I would need to wait for an actual Saturday or freeze the clock. The test already covers the same path by injecting `now` directly.
+**How I reproduced it.** Ran `pytest tests/test_streaks.py`. `test_streak_increments_on_sunday` failed. A Saturday listen followed by a Sunday listen left the streak at `1` instead of `2`. I did not reproduce it through the endpoint. `POST /songs/<id>/listen` calls `datetime.now()` internally, so reproducing it live would need an actual Saturday or a frozen clock. The test already covers the same path by injecting `now` directly.
 
-**How I found the root cause.** I started from the failing test, which called `update_listening_streak` directly and asserted a specific return value. I traced the method to its definition in `services/streak_service.py`. Since every other streak calculation passed and only the Saturday-to-Sunday case was misbehaving, I zoomed into the branch of the calculation that uses `today.weekday()`, which is the only place the day-of-week matters.
+**How I found the root cause.** I started from the failing test. It called `update_listening_streak` directly and asserted a specific return value. I traced the method to `services/streak_service.py`. Every other streak case passed. Only the Saturday-to-Sunday case failed. So I focused on the one branch that uses `today.weekday()`.
 
-**The root cause.** In Python's `datetime.date`, `weekday()` returns `0` for Monday through `6` for Sunday, so `today.weekday() != 6` is true on every day except Sunday. The increment branch reads:
+**The root cause.** In Python, `weekday()` returns `0` for Monday and `6` for Sunday. So `today.weekday() != 6` is true every day except Sunday. The increment branch reads:
 
 ```python
 elif days_since_last == 1 and today.weekday() != 6:
     user.listening_streak += 1
 ```
 
-That extra clause means the "listened yesterday, increment today" logic only fires when today is not Sunday. On a Sunday, even when the previous listen was on Saturday and `days_since_last == 1` is true, the compound condition evaluates to false, execution falls through to the `else` branch, and the streak is reset to `1`. So any streak that would naturally span a Saturday-to-Sunday boundary silently collapses every week on Sunday, which is exactly what the reporter and the failing test observed.
+On a Sunday, the second half of that condition is false. The whole condition fails. Execution falls through to the `else` branch and the streak resets to `1`. Any streak that spans Saturday to Sunday collapses every week.
 
-**My fix and side-effect check.** I dropped the `and today.weekday() != 6` clause from the increment branch in `services/streak_service.py`, so the condition is now the plain `elif days_since_last == 1:` that the docstring already describes. That is a one-token change and it targets the exact expression identified in the root cause: the increment branch now fires on any day that is exactly one calendar day after the previous listen, Sunday included.
+**My fix and side-effect check.** I dropped the `and today.weekday() != 6` clause. The branch is now `elif days_since_last == 1:`, which matches the docstring. It fires on any day exactly one calendar day after the previous listen, Sunday included.
 
 Side-effect checks:
 
-1. `pytest tests/test_streaks.py` passes all 5 tests, including `test_streak_increments_on_sunday`, which was the failing test I used to reproduce the issue.
-2. I traced the other branches of `update_listening_streak` to confirm the fix is scoped: the new-user branch (`last_listened_at is None` sets streak to `1`), the same-day branch (`days_since_last == 0` early-returns), and the gap branch (`days_since_last > 1` resets to `1`) are all untouched by the edit. The only path whose behavior changes is `days_since_last == 1`, which is the intended target.
-3. The endpoint contract does not change. `POST /songs/<song_id>/listen` still records a `ListeningEvent` and updates the streak; `GET /users/<user_id>/streak` still returns `{"user_id": ..., "streak": N}`. The fix is a pure internal correction to the increment condition.
+1. `pytest tests/test_streaks.py` passes all 5 tests, including `test_streak_increments_on_sunday`.
+2. The other branches of `update_listening_streak` are untouched. The new-user branch still sets streak to `1`. The same-day branch still returns early. The gap branch still resets to `1`. Only the `days_since_last == 1` path changes.
+3. The endpoint contract does not change. `POST /songs/<song_id>/listen` still records a `ListeningEvent`. `GET /users/<user_id>/streak` still returns `{"user_id": ..., "streak": N}`.
 
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
-**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell (`FLASK_APP=app:create_app flask shell`), picked `nova` as the viewer and `simone` (one of nova's friends) as the listener. Deleted simone's existing recent listening events so the stale one would be her most-recent, then inserted a new `ListeningEvent` with `listened_at` back-dated to 20 hours ago:
+**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell (`FLASK_APP=app:create_app flask shell`), I picked `nova` as the viewer and `simone` as the listener. Simone is one of nova's friends. I first deleted simone's existing recent listening events so the stale one would be her most-recent. Then I inserted a new `ListeningEvent` back-dated to 20 hours ago:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -111,43 +141,45 @@ Then called the endpoint:
 curl "http://127.0.0.1:5000/feed/<nova.id>/listening-now"
 ```
 
-Simone appeared in the response with a `listened_at` of 2026-07-01, i.e. yesterday's date, on a request made 2026-07-02. That is the exact behavior the issue describes.
+Simone appeared in the response with a `listened_at` of 2026-07-01. The request was made on 2026-07-02. That is a listener from yesterday, exactly what the issue describes.
 
-**How I found the root cause.** I traced from `routes/feed.py`'s `listening_now` endpoint to `services/feed_service.get_friends_listening_now`. The interesting piece is the `cutoff` on line 32 and the `RECENT_THRESHOLD` constant on line 13: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` with `RECENT_THRESHOLD = timedelta(hours=24)`. The rest of the function (friends filter, order-by, dedup) reads correctly, so I focused on how the cutoff is computed.
+**How I found the root cause.** I traced from `routes/feed.py`'s `listening_now` endpoint into `services/feed_service.get_friends_listening_now`. The interesting parts are the `cutoff` on line 32 and the `RECENT_THRESHOLD` constant on line 13. The cutoff is computed as `datetime.now(timezone.utc) - RECENT_THRESHOLD`, and the threshold is `timedelta(hours=24)`. The rest of the function reads correctly: friend filter, ordering, dedup. So I focused on the cutoff.
 
-**The root cause.** The cutoff is a fixed 24-hour rolling window: `now - 24h`. That is not the same as "today". At any moment other than exactly midnight, `now - 24h` sits partway through yesterday, so listens from yesterday afternoon and evening (which are calendar-yesterday from the user's perspective) still fall inside the window and surface in the feed. To only show today's listens, the cutoff has to be dynamic: the first moment of the current calendar day. With a fixed `timedelta` there is no way to align the window with the day boundary except by coincidence at midnight.
+**The root cause.** The cutoff is a fixed 24-hour rolling window: `now - 24h`. That is not the same as "today". At any moment other than midnight, `now - 24h` sits partway through yesterday. So listens from yesterday afternoon and evening still fall inside the window and show up in the feed. To only show today's listens, the cutoff has to be dynamic: the first moment of today's calendar day. A fixed `timedelta` cannot align with the day boundary except by coincidence at midnight.
 
-**My fix and side-effect check.** Changed the cutoff from a fixed offset to the first moment of the current UTC calendar day: `datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`. Removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` import.
+**My fix and side-effect check.** I changed the cutoff to `datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`. That is the first moment of today in UTC. I removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` import.
 
 Side-effect checks:
 
-1. Added a new test file `tests/test_feed.py` with 6 regression tests covering the boundary and adjacent behaviors: `test_feed_excludes_listen_from_yesterday` (a listen 1 second before midnight today must not appear), `test_feed_includes_listen_from_today` (a listen 1 second after midnight today does appear), `test_feed_dedupes_multiple_events_per_friend` (only the most recent today's listen shows), `test_feed_excludes_non_friends`, `test_feed_empty_for_user_with_no_friends`, and `test_feed_raises_for_unknown_user`. Under the old 24-hour rolling window, `test_feed_excludes_listen_from_yesterday` would fail (a 1-second-before-midnight listen is still within 24h), so it doubles as a regression guard against reverting to a fixed threshold.
+1. Added `tests/test_feed.py` with 6 regression tests. They cover: a listen 1 second before midnight is excluded (`test_feed_excludes_listen_from_yesterday`), a listen 1 second after midnight is included, dedup keeps only the most recent event per friend, non-friends are excluded, a user with no friends gets an empty feed, and an unknown user raises. Under the old 24-hour window, the yesterday-boundary test would have failed. It now doubles as a regression guard against reverting to a fixed threshold.
 2. `pytest tests/test_feed.py` passes all 6 tests.
 3. `pytest tests/` runs cleanly with no new regressions in other suites.
-4. Re-ran the original shell reproduction against a listen back-dated to `midnight_today - 1 second` (unambiguously yesterday). Under the fix, simone does not appear in nova's feed. A companion listen at `midnight_today + 1 second` does appear, confirming the boundary lands where intended.
-5. `get_activity_feed` in the same file is untouched: it does not use the threshold or the cutoff.
-6. Endpoint contract is preserved. `GET /feed/<user_id>/listening-now` still returns `{"feed": [...], "count": N}` with `{friend, song, listened_at}` entries; only the recency filter tightens.
+4. Re-ran the shell reproduction with a listen at `midnight_today - 1 second` (clearly yesterday). Under the fix, simone no longer appears in nova's feed. A companion listen at `midnight_today + 1 second` does appear.
+5. `get_activity_feed` in the same file is untouched. It does not use the threshold or the cutoff.
+6. Endpoint contract is preserved. `GET /feed/<user_id>/listening-now` still returns `{"feed": [...], "count": N}`. Only the recency filter tightens.
 
 ### Issue #3 — The same song keeps showing up twice in search
 
-**How I reproduced it.** I could not reproduce it. Despite the README describing this issue and the test comment in `test_search_no_duplicates_multi_tag_song` saying `# Should be 1, bug causes it to be 3`, running `pytest tests/test_search.py` shows all 5 tests passing, including the multi-tag case. Manual verification against the seeded DB confirmed the same: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` returns `count: 1` and a single "Crown Heights Anthem" entry, even though that song has 3 tags. I also searched every seeded song by title and by artist, and every one returned exactly one occurrence, regardless of tag count (0, 1, or 3). So on the current codebase, the issue appears to have already been fixed or was never triggered under this SQLAlchemy version.
+**How I reproduced it.** I could not reproduce it. The README lists this issue. The test comment in `test_search_no_duplicates_multi_tag_song` says `# Should be 1, bug causes it to be 3`. But running `pytest tests/test_search.py` shows all 5 tests passing, including the multi-tag case. A manual check confirms it: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` returns `count: 1` and a single "Crown Heights Anthem", even though that song has 3 tags. I searched every seeded song by title and by artist. Every song returned exactly one occurrence, regardless of tag count. So on this codebase, the issue does not manifest.
 
-**How I found the root cause.** I asked AI to explain why the test comment did not match the observed behavior. From that I learned that `db.session.query(Song)` returns SQLAlchemy's *legacy* `Query` object, and `Query.all()` applies implicit entity uniquing: it collapses duplicate ORM rows by primary key before returning them to the caller. Under the newer 2.0-style API (`session.execute(select(...)).scalars().all()`), uniquing is not implicit and would require an explicit `.unique()` call. Since `services/search_service.py` uses the legacy `db.session.query(...)`, the join-generated duplicates in `search_songs` are silently deduplicated, and the reported symptom never surfaces to the caller. Reference: [SQLAlchemy docs — `Query.all()`](https://docs.sqlalchemy.org/en/21/orm/queryguide/query.html#sqlalchemy.orm.Query.all).
+**How I found the root cause.** I asked AI why the test comment did not match observed behavior. From that I learned two things. `db.session.query(Song)` returns SQLAlchemy's *legacy* `Query` object. `Query.all()` applies implicit entity uniquing: it collapses duplicate ORM rows by primary key. The newer 2.0-style API (`session.execute(select(...)).scalars().all()`) does not do this implicitly. It requires an explicit `.unique()` call. Since `services/search_service.py` uses the legacy form, the SQL-level duplicates from `outerjoin(song_tags, ...)` are silently deduplicated, and the symptom never reaches the caller. Reference: [SQLAlchemy docs — `Query.all()`](https://docs.sqlalchemy.org/en/21/orm/queryguide/query.html#sqlalchemy.orm.Query.all).
 
-**The root cause.** The user-visible symptom reported in Issue #3 is not present on the current codebase, so there is no bug to fix in the strict sense. However, the code is still fragile: `search_songs` relies on the *implicit* entity-uniquing behavior of the legacy `Query.all()` API to hide the fact that its `outerjoin(song_tags, ...)` produces one row per (song, tag) pair. If a future developer migrates this query to the 2.0-style `session.execute(select(Song)).scalars().all()` pattern (which SQLAlchemy 2.x recommends) and forgets to add `.unique()`, the duplicates will silently start reaching the caller and Issue #3 will materialize for real. The `outerjoin` could be defended on forward-looking grounds: keeping the query resilient to a future filter that references tags without dropping tag-less songs. But as things stand today it is not earning its keep. It is not needed by the current filter, which searches only on `Song.title` and `Song.artist`. It is not preventing an N+1 on tag loading: `Song.tags` is declared `lazy="subquery"` in `models.py:90`, so accessing `.tags` on the results issues a single batched second query regardless of what the parent search joined to. This was confirmed by enabling SQLAlchemy engine logging: both the original query and a version with the `outerjoin` removed emit exactly 2 SQL statements to load 13 songs and all their tags. Given no filter references tags today, the YAGNI call is to remove it and add it back the day a tag-based filter is actually introduced.
+**The root cause.** The symptom in Issue #3 is not present today, so there is nothing to fix in the strict sense. But the code is fragile. `search_songs` depends on the legacy `Query.all()`'s implicit uniquing to hide the fact that `outerjoin(song_tags, ...)` produces one row per (song, tag) pair. If someone migrates this query to `session.execute(select(Song)).scalars().all()` and forgets `.unique()`, the duplicates will start reaching the caller and Issue #3 will materialize for real.
 
-**My fix and side-effect check.** Removed the `outerjoin(song_tags, ...)` from `search_songs` entirely, which eliminates the SQL-level duplication that the legacy `Query.all()` was silently uniquing. In the same change, migrated the query from the legacy `db.session.query(...)` API to the 2.0-style `db.session.execute(select(Song).where(...)).scalars().all()` form as a modernization pass. Because there are no duplicate rows to collapse now, no explicit `.unique()` is required. The unused `song_tags` import was also removed.
+The `outerjoin` could be defended as forward-looking: keep the query resilient in case a future filter references tags. But today it is not earning its keep. It is not needed by the current filter, which only searches `Song.title` and `Song.artist`. It is not preventing an N+1 either. `Song.tags` is declared `lazy="subquery"` in `models.py:90`. Accessing `.tags` on the results issues one batched second query, regardless of what the parent joined. SQLAlchemy engine logging confirms this: both the original query and a version without the outerjoin emit exactly 2 SQL statements. So the YAGNI call is to remove the join now and add it back when a tag-based filter is actually introduced.
+
+**My fix and side-effect check.** I removed the `outerjoin(song_tags, ...)` from `search_songs`. That eliminates the SQL-level duplication. I also migrated the query from the legacy `db.session.query(...)` API to the 2.0-style `db.session.execute(select(Song).where(...)).scalars().all()` as a modernization pass. No `.unique()` is needed because there are no duplicate rows to collapse. I also removed the unused `song_tags` import.
 
 Side-effect checks:
 
 1. `pytest tests/test_search.py` passes all 5 pre-existing tests (multi-tag, 1-tag, 0-tag, basic match, empty result).
-2. `pytest tests/` runs cleanly except for the pre-existing `test_streak_increments_on_sunday` failure, which is Issue #1 and tracked separately. No new regressions elsewhere.
-3. Added a new regression test `test_search_does_not_n_plus_1_on_tag_loading` in `tests/test_search.py`. It attaches a `before_cursor_execute` listener to the engine, calls `search_songs("a")` against the fixture (which matches multiple seeded songs), and asserts exactly 2 SELECT statements are emitted (one for songs, one for the batched `lazy="subquery"` tag load). If someone later loses the batching, for example by switching `Song.tags` to `lazy="select"`, this test will fail with the observed statement count and a diff of the extra queries.
-4. Manual endpoint check: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` still returns `count: 1` with `tags: ["rap", "hip-hop", "boom bap"]` for the 3-tag song, and `?q=Midnight+Drive` still returns the tag-less song once with `tags: []`. The JSON contract of unique songs plus a tag list (empty when absent) is preserved.
+2. `pytest tests/` runs cleanly with no new regressions.
+3. Added a new regression test `test_search_does_not_n_plus_1_on_tag_loading` in `tests/test_search.py`. It attaches a `before_cursor_execute` listener to the engine, calls `search_songs("a")` against the fixture, and asserts exactly 2 SELECT statements are emitted. One for songs, one for the batched `lazy="subquery"` tag load. If someone switches `Song.tags` to `lazy="select"`, this test fails with the observed count and the extra statements.
+4. Manual endpoint check: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` still returns `count: 1` with `tags: ["rap", "hip-hop", "boom bap"]`. `?q=Midnight+Drive` still returns the tag-less song once with `tags: []`. The JSON contract of unique songs plus a tag list (empty when absent) is preserved.
 
 ### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
 
-**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell, picked `nova` as the song sharer and `darius` as the rater, then called `rate_song` directly and inspected nova's notifications before and after:
+**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell, I picked `nova` as the sharer and `darius` as the rater. I called `rate_song` directly and inspected nova's notifications before and after:
 
 ```python
 from app import db
@@ -163,41 +195,41 @@ rate_song(darius.id, song.id, 5)
 print("after: ", len(get_notifications(nova.id)))
 ```
 
-The notification count is `1` both before and after (the seed inserts one existing `song_added_to_playlist` notification for nova). Filtering by `type == "song_rated"` gives `0` entries, confirming that no rating notification is created for nova despite darius rating her song.
+The count is `1` both before and after. The seed inserts one existing `song_added_to_playlist` notification for nova. Filtering by `type == "song_rated"` gives `0` entries. Darius rated nova's song and no notification was created.
 
-**How I found the root cause.** I opened `services/notification_service.py` and compared the two functions that share the same "someone did X to a shared song" shape. `add_to_playlist` on lines 35-70 loads the song, the adder, and the playlist, mutates the playlist, and then calls `create_notification` for `song.shared_by` with a `song_added_to_playlist` message when the actor is not the sharer. `rate_song` on lines 73-110 does the parallel work for ratings (upsert of a `Rating`, commit) but stops there and returns. There is no `create_notification` call and no `Notification` construction anywhere in `rate_song`.
+**How I found the root cause.** I opened `services/notification_service.py` and compared the two sibling functions that follow the "someone did X to a shared song" shape. `add_to_playlist` on lines 35-70 loads the song, adder, and playlist, mutates the playlist, then calls `create_notification` for `song.shared_by` with a `song_added_to_playlist` message when the actor is not the sharer. `rate_song` on lines 73-110 does the parallel work for ratings: it upserts the `Rating` and commits, then returns. It has no `create_notification` call. It does not construct a `Notification` at all.
 
-**The root cause.** `rate_song` never emits a notification. The notification side effect exists in the sibling `add_to_playlist` function but was omitted from the rate path, which is exactly the asymmetry the reporter observed. No condition, comparison, or subtle guard is involved: the call is simply missing.
+**The root cause.** `rate_song` never emits a notification. The side effect exists in `add_to_playlist` but was omitted from the rate path. That is the asymmetry the reporter observed. No condition or subtle guard is involved: the call is simply missing.
 
-**My fix and side-effect check.** Added the missing `create_notification` call at the end of `rate_song`, mirroring the pattern in `add_to_playlist`: after `db.session.commit()`, if `song.shared_by != user_id`, create a `song_rated` notification whose body includes the rater's username, the song title, and the score. Kept the same self-rate guard so someone rating their own song does not notify themselves.
+**My fix and side-effect check.** I added the missing `create_notification` call at the end of `rate_song`, mirroring the pattern in `add_to_playlist`. After `db.session.commit()`, if `song.shared_by != user_id`, it creates a `song_rated` notification. The body includes the rater's username, the song title, and the score. The self-rate guard is kept, so a sharer rating their own song does not notify themselves.
 
 Side-effect checks:
 
-1. Added `tests/test_notifications.py` with 3 regression tests: `test_rate_song_notifies_sharer` (rater ≠ sharer produces exactly one `song_rated` notification with rater name, song title, and score in the body), `test_rate_song_does_not_notify_self` (sharer rating their own song produces no notification), and `test_rate_song_upsert_still_notifies` (updating an existing rating still notifies, matching `add_to_playlist`'s per-call behavior). All three pass.
-2. `pytest tests/` runs cleanly except for `test_playlist_returns_songs_in_order`, which is Issue #5 and tracked separately. No new regressions elsewhere.
-3. Confirmed the rest of `rate_song` is untouched: the score-range validation, missing-song and missing-user lookups, and the upsert branch (existing rating gets its score mutated in place; new rating gets added) all behave exactly as before. The fix only adds a new call at the tail.
-4. Endpoint contract is preserved. `POST /songs/<song_id>/rate` still returns the `Rating.to_dict()` at HTTP 201; the notification is a background side effect, not part of the response.
-5. Incidental finding, out of scope for this fix: `add_to_playlist` in the same file mutates `playlist.songs` via the ORM relationship, but the `playlist_entries` join table declares `position` and `added_by` as `NOT NULL`, so the first-time add path raises `IntegrityError` before it can reach its own `create_notification`. That is a separate latent bug in the playlist path, worth filing but not part of Issue #4.
+1. Added `tests/test_notifications.py` with 3 regression tests. `test_rate_song_notifies_sharer` checks that a rater different from the sharer produces exactly one `song_rated` notification with the rater name, song title, and score in the body. `test_rate_song_does_not_notify_self` checks that the sharer rating their own song produces no notification. `test_rate_song_upsert_still_notifies` checks that updating an existing rating still notifies, matching `add_to_playlist`'s per-call behavior. All three pass.
+2. `pytest tests/` runs cleanly with no new regressions.
+3. The rest of `rate_song` is untouched. The score-range validation, missing-song and missing-user lookups, and the upsert branch all behave as before. The fix only adds a call at the tail.
+4. Endpoint contract is preserved. `POST /songs/<song_id>/rate` still returns `Rating.to_dict()` at HTTP 201. The notification is a background side effect, not part of the response.
+5. Incidental finding, out of scope for this fix: `add_to_playlist` in the same file mutates `playlist.songs` via the ORM relationship, but `playlist_entries` declares `position` and `added_by` as `NOT NULL`. The first-time add path raises `IntegrityError` before it can reach its own `create_notification`. That is a separate latent bug in the playlist path, worth filing but not part of Issue #4.
 
 ### Issue #5 — The last song in a playlist never shows up
 
-**How I reproduced it.** Ran `pytest tests/test_playlists.py`. Two tests failed: `test_playlist_returns_all_songs` (expected 5 songs, got 4; the test comment even calls out `# Bug causes this to return 4`) and `test_playlist_returns_songs_in_order` (expected `["Track 1", ..., "Track 5"]`, got `["Track 1", ..., "Track 4"]`, so "Track 5" is the one missing). The seed data fixture inserts 5 songs at positions 1 through 5 into the playlist, and the last one is dropped from the response.
+**How I reproduced it.** Ran `pytest tests/test_playlists.py`. Two tests failed. `test_playlist_returns_all_songs` expected 5 songs but got 4. The test comment even says `# Bug causes this to return 4`. `test_playlist_returns_songs_in_order` expected `["Track 1", ..., "Track 5"]` but got `["Track 1", ..., "Track 4"]`. "Track 5" is the one missing. The seed data fixture inserts 5 songs at positions 1 through 5. The last one is dropped from the response.
 
-**How I found the root cause.** I opened `services/playlist_service.py` and read `get_playlist_songs`. The query itself is correct (joins `playlist_entries`, filters by `playlist_id`, orders by `position` ascending, and materializes with `.all()`). The suspicious line is the return statement on line 66:
+**How I found the root cause.** I opened `services/playlist_service.py` and read `get_playlist_songs`. The query itself is correct. It joins `playlist_entries`, filters by `playlist_id`, orders by `position` ascending, and materializes with `.all()`. The suspicious line is the return statement on line 66:
 
 ```python
 return [song.to_dict() for song in songs[:-1]]
 ```
 
-The `songs[:-1]` slice drops the last element of the list unconditionally. That is what strips "Track 5" from the response and what the failing tests were flagging.
+The `songs[:-1]` slice drops the last element unconditionally. That is what strips "Track 5" from the response.
 
-**The root cause.** The comprehension iterates over `songs[:-1]` instead of `songs`. Since Python's `list[:-1]` returns every element except the last, the final song at the highest `position` is always excluded from the response, regardless of how many songs the playlist has (as long as it has at least one, since `[][:-1]` is still `[]`, so the empty-playlist case is unaffected).
+**The root cause.** The comprehension iterates over `songs[:-1]` instead of `songs`. Python's `list[:-1]` returns every element except the last. So the song at the highest `position` is always excluded, regardless of playlist size. The empty-playlist case is unaffected because `[][:-1]` is still `[]`.
 
-**My fix and side-effect check.** Changed `songs[:-1]` to `songs` in the return statement. That is a one-token change and it targets the exact slice identified in the root cause: the comprehension now iterates over every song returned by the query.
+**My fix and side-effect check.** I changed `songs[:-1]` to `songs` in the return statement. That is a one-token change. The comprehension now iterates over every song returned by the query.
 
 Side-effect checks:
 
-1. `pytest tests/test_playlists.py` passes all 3 tests, including `test_playlist_returns_all_songs` and `test_playlist_returns_songs_in_order` which were failing before, plus `test_empty_playlist_returns_empty_list` which was unaffected by the bug (`[][:-1]` is still `[]`) and continues to pass.
+1. `pytest tests/test_playlists.py` passes all 3 tests. `test_playlist_returns_all_songs` and `test_playlist_returns_songs_in_order` were failing before. `test_empty_playlist_returns_empty_list` was unaffected by the bug (`[][:-1]` is still `[]`) and continues to pass.
 2. `pytest tests/` runs cleanly with 23 passing tests and no failures.
-3. The query and ordering logic are untouched: the `join`, `filter`, and `order_by(asc(position))` still shape the result the same way, so the fix only changes how many elements are serialized, not which ones are selected or how they are ordered.
-4. Endpoint contract is preserved. `GET /playlists/<playlist_id>/songs` still returns `{"songs": [...], "count": N}`, but `count` now correctly reflects the full playlist size instead of `size - 1`.
+3. The query and ordering logic are untouched. The `join`, `filter`, and `order_by(asc(position))` still shape the result the same way. Only the number of serialized elements changes.
+4. Endpoint contract is preserved. `GET /playlists/<playlist_id>/songs` still returns `{"songs": [...], "count": N}`. `count` now reflects the full playlist size instead of `size - 1`.
