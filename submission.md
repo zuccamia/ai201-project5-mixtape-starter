@@ -64,11 +64,24 @@ POST /songs/<id>/listen {user_id} ─▶ streak_service.record_listening_event(u
 
 **How I reproduced it.** Ran `pytest tests/test_streaks.py`. `test_streak_increments_on_sunday` failed: a Saturday listen followed by a Sunday listen left the streak at `1` instead of `2`. I did not reproduce it live via `POST /songs/<id>/listen`, since the endpoint calls `datetime.now()` internally, so I would need to wait for an actual Saturday or freeze the clock. The test already covers the same path by injecting `now` directly.
 
-**How I found the root cause.**
+**How I found the root cause.** I started from the failing test, which called `update_listening_streak` directly and asserted a specific return value. I traced the method to its definition in `services/streak_service.py`. Since every other streak calculation passed and only the Saturday-to-Sunday case was misbehaving, I zoomed into the branch of the calculation that uses `today.weekday()`, which is the only place the day-of-week matters.
 
-**The root cause.**
+**The root cause.** In Python's `datetime.date`, `weekday()` returns `0` for Monday through `6` for Sunday, so `today.weekday() != 6` is true on every day except Sunday. The increment branch reads:
 
-**My fix and side-effect check.**
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+```
+
+That extra clause means the "listened yesterday, increment today" logic only fires when today is not Sunday. On a Sunday, even when the previous listen was on Saturday and `days_since_last == 1` is true, the compound condition evaluates to false, execution falls through to the `else` branch, and the streak is reset to `1`. So any streak that would naturally span a Saturday-to-Sunday boundary silently collapses every week on Sunday, which is exactly what the reporter and the failing test observed.
+
+**My fix and side-effect check.** I dropped the `and today.weekday() != 6` clause from the increment branch in `services/streak_service.py`, so the condition is now the plain `elif days_since_last == 1:` that the docstring already describes. That is a one-token change and it targets the exact expression identified in the root cause: the increment branch now fires on any day that is exactly one calendar day after the previous listen, Sunday included.
+
+Side-effect checks:
+
+1. `pytest tests/test_streaks.py` passes all 5 tests, including `test_streak_increments_on_sunday`, which was the failing test I used to reproduce the issue.
+2. I traced the other branches of `update_listening_streak` to confirm the fix is scoped: the new-user branch (`last_listened_at is None` sets streak to `1`), the same-day branch (`days_since_last == 0` early-returns), and the gap branch (`days_since_last > 1` resets to `1`) are all untouched by the edit. The only path whose behavior changes is `days_since_last == 1`, which is the intended target.
+3. The endpoint contract does not change. `POST /songs/<song_id>/listen` still records a `ListeningEvent` and updates the streak; `GET /users/<user_id>/streak` still returns `{"user_id": ..., "streak": N}`. The fix is a pure internal correction to the increment condition.
 
 ### Issue #2 — Friends Listening Now shows people from yesterday
 
