@@ -144,3 +144,37 @@ Side-effect checks:
 2. `pytest tests/` runs cleanly except for the pre-existing `test_streak_increments_on_sunday` failure, which is Issue #1 and tracked separately. No new regressions elsewhere.
 3. Added a new regression test `test_search_does_not_n_plus_1_on_tag_loading` in `tests/test_search.py`. It attaches a `before_cursor_execute` listener to the engine, calls `search_songs("a")` against the fixture (which matches multiple seeded songs), and asserts exactly 2 SELECT statements are emitted (one for songs, one for the batched `lazy="subquery"` tag load). If someone later loses the batching, for example by switching `Song.tags` to `lazy="select"`, this test will fail with the observed statement count and a diff of the extra queries.
 4. Manual endpoint check: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` still returns `count: 1` with `tags: ["rap", "hip-hop", "boom bap"]` for the 3-tag song, and `?q=Midnight+Drive` still returns the tag-less song once with `tags: []`. The JSON contract of unique songs plus a tag list (empty when absent) is preserved.
+
+### Issue #4 — I got notified when a friend added my song to a playlist but not when they rated it
+
+**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell, picked `nova` as the song sharer and `darius` as the rater, then called `rate_song` directly and inspected nova's notifications before and after:
+
+```python
+from app import db
+from models import User, Song
+from services.notification_service import rate_song, get_notifications
+
+nova   = db.session.query(User).filter_by(username="nova").first()
+darius = db.session.query(User).filter_by(username="darius").first()
+song   = db.session.query(Song).filter_by(shared_by=nova.id).first()   # "Midnight Drive"
+
+print("before:", len(get_notifications(nova.id)))
+rate_song(darius.id, song.id, 5)
+print("after: ", len(get_notifications(nova.id)))
+```
+
+The notification count is `1` both before and after (the seed inserts one existing `song_added_to_playlist` notification for nova). Filtering by `type == "song_rated"` gives `0` entries, confirming that no rating notification is created for nova despite darius rating her song.
+
+**How I found the root cause.** I opened `services/notification_service.py` and compared the two functions that share the same "someone did X to a shared song" shape. `add_to_playlist` on lines 35-70 loads the song, the adder, and the playlist, mutates the playlist, and then calls `create_notification` for `song.shared_by` with a `song_added_to_playlist` message when the actor is not the sharer. `rate_song` on lines 73-110 does the parallel work for ratings (upsert of a `Rating`, commit) but stops there and returns. There is no `create_notification` call and no `Notification` construction anywhere in `rate_song`.
+
+**The root cause.** `rate_song` never emits a notification. The notification side effect exists in the sibling `add_to_playlist` function but was omitted from the rate path, which is exactly the asymmetry the reporter observed. No condition, comparison, or subtle guard is involved: the call is simply missing.
+
+**My fix and side-effect check.** Added the missing `create_notification` call at the end of `rate_song`, mirroring the pattern in `add_to_playlist`: after `db.session.commit()`, if `song.shared_by != user_id`, create a `song_rated` notification whose body includes the rater's username, the song title, and the score. Kept the same self-rate guard so someone rating their own song does not notify themselves.
+
+Side-effect checks:
+
+1. Added `tests/test_notifications.py` with 3 regression tests: `test_rate_song_notifies_sharer` (rater ≠ sharer produces exactly one `song_rated` notification with rater name, song title, and score in the body), `test_rate_song_does_not_notify_self` (sharer rating their own song produces no notification), and `test_rate_song_upsert_still_notifies` (updating an existing rating still notifies, matching `add_to_playlist`'s per-call behavior). All three pass.
+2. `pytest tests/` runs cleanly except for `test_playlist_returns_songs_in_order`, which is Issue #5 and tracked separately. No new regressions elsewhere.
+3. Confirmed the rest of `rate_song` is untouched: the score-range validation, missing-song and missing-user lookups, and the upsert branch (existing rating gets its score mutated in place; new rating gets added) all behave exactly as before. The fix only adds a new call at the tail.
+4. Endpoint contract is preserved. `POST /songs/<song_id>/rate` still returns the `Rating.to_dict()` at HTTP 201; the notification is a background side effect, not part of the response.
+5. Incidental finding, out of scope for this fix: `add_to_playlist` in the same file mutates `playlist.songs` via the ORM relationship, but the `playlist_entries` join table declares `position` and `added_by` as `NOT NULL`, so the first-time add path raises `IntegrityError` before it can reach its own `create_notification`. That is a separate latent bug in the playlist path, worth filing but not part of Issue #4.
