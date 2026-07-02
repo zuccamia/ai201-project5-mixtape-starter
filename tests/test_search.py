@@ -5,6 +5,7 @@ Tests for song search logic.
 """
 
 import pytest
+from sqlalchemy import event
 from app import create_app, db
 from models import User, Song, Tag, song_tags
 from services.search_service import search_songs
@@ -117,3 +118,32 @@ def test_search_returns_empty_for_no_match(app, seed_songs):
     with app.app_context():
         results = search_songs("zzz_no_match_zzz")
         assert results == []
+
+
+def test_search_does_not_n_plus_1_on_tag_loading(app, seed_songs):
+    """
+    search_songs plus tag serialization should emit a constant number of
+    SELECT statements regardless of how many songs match. Guards against a
+    regression where Song.tags loses its lazy="subquery" batching or the
+    query is refactored in a way that defeats batching.
+    """
+    with app.app_context():
+        db.session.expire_all()
+
+        statements = []
+
+        def counter(conn, cursor, statement, parameters, context, executemany):
+            if statement.strip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(db.engine, "before_cursor_execute", counter)
+        try:
+            results = search_songs("a")
+        finally:
+            event.remove(db.engine, "before_cursor_execute", counter)
+
+        assert len(results) >= 2, "test needs multiple matching songs to detect N+1"
+        assert len(statements) == 2, (
+            f"expected 2 SELECTs (songs + batched tag load), got {len(statements)}:\n"
+            + "\n---\n".join(statements)
+        )

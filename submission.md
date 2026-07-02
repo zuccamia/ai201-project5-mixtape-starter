@@ -57,3 +57,68 @@ POST /songs/<id>/listen {user_id} ─▶ streak_service.record_listening_event(u
 
    ─── later ───  GET /feed/<friend_id>/listening-now ─▶ flow (2) picks it up  (if within 24h & friend's most-recent event)
 ```
+
+## Root Cause Analysis
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it.** Ran `pytest tests/test_streaks.py`. `test_streak_increments_on_sunday` failed: a Saturday listen followed by a Sunday listen left the streak at `1` instead of `2`. I did not reproduce it live via `POST /songs/<id>/listen`, since the endpoint calls `datetime.now()` internally, so I would need to wait for an actual Saturday or freeze the clock. The test already covers the same path by injecting `now` directly.
+
+**How I found the root cause.**
+
+**The root cause.**
+
+**My fix and side-effect check.**
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it.** Seeded the DB with `python seed_data.py`. In a Flask shell (`FLASK_APP=app:create_app flask shell`), picked `nova` as the viewer and `simone` (one of nova's friends) as the listener. Deleted simone's existing recent listening events so the stale one would be her most-recent, then inserted a new `ListeningEvent` with `listened_at` back-dated to 20 hours ago:
+
+```python
+from datetime import datetime, timedelta, timezone
+from app import db
+from models import User, Song, ListeningEvent
+
+me     = db.session.query(User).filter_by(username="nova").first()
+friend = db.session.query(User).filter_by(username="simone").first()
+song   = db.session.query(Song).first()
+
+db.session.query(ListeningEvent).filter_by(user_id=friend.id).delete()
+
+stale = datetime.now(timezone.utc) - timedelta(hours=20)
+db.session.add(ListeningEvent(user_id=friend.id, song_id=song.id, listened_at=stale))
+db.session.commit()
+
+print("me.id =", me.id)
+```
+
+Then called the endpoint:
+
+```bash
+curl "http://127.0.0.1:5000/feed/<nova.id>/listening-now"
+```
+
+Simone appeared in the response with a `listened_at` of 2026-07-01, i.e. yesterday's date, on a request made 2026-07-02. That is the exact behavior the issue describes.
+
+**How I found the root cause.**
+
+**The root cause.**
+
+**My fix and side-effect check.**
+
+### Issue #3 — The same song keeps showing up twice in search
+
+**How I reproduced it.** I could not reproduce it. Despite the README describing this issue and the test comment in `test_search_no_duplicates_multi_tag_song` saying `# Should be 1, bug causes it to be 3`, running `pytest tests/test_search.py` shows all 5 tests passing, including the multi-tag case. Manual verification against the seeded DB confirmed the same: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` returns `count: 1` and a single "Crown Heights Anthem" entry, even though that song has 3 tags. I also searched every seeded song by title and by artist, and every one returned exactly one occurrence, regardless of tag count (0, 1, or 3). So on the current codebase, the issue appears to have already been fixed or was never triggered under this SQLAlchemy version.
+
+**How I found the root cause.** I asked AI to explain why the test comment did not match the observed behavior. From that I learned that `db.session.query(Song)` returns SQLAlchemy's *legacy* `Query` object, and `Query.all()` applies implicit entity uniquing: it collapses duplicate ORM rows by primary key before returning them to the caller. Under the newer 2.0-style API (`session.execute(select(...)).scalars().all()`), uniquing is not implicit and would require an explicit `.unique()` call. Since `services/search_service.py` uses the legacy `db.session.query(...)`, the join-generated duplicates in `search_songs` are silently deduplicated, and the reported symptom never surfaces to the caller. Reference: [SQLAlchemy docs — `Query.all()`](https://docs.sqlalchemy.org/en/21/orm/queryguide/query.html#sqlalchemy.orm.Query.all).
+
+**The root cause.** The user-visible symptom reported in Issue #3 is not present on the current codebase, so there is no bug to fix in the strict sense. However, the code is still fragile: `search_songs` relies on the *implicit* entity-uniquing behavior of the legacy `Query.all()` API to hide the fact that its `outerjoin(song_tags, ...)` produces one row per (song, tag) pair. If a future developer migrates this query to the 2.0-style `session.execute(select(Song)).scalars().all()` pattern (which SQLAlchemy 2.x recommends) and forgets to add `.unique()`, the duplicates will silently start reaching the caller and Issue #3 will materialize for real. The `outerjoin` could be defended on forward-looking grounds: keeping the query resilient to a future filter that references tags without dropping tag-less songs. But as things stand today it is not earning its keep. It is not needed by the current filter, which searches only on `Song.title` and `Song.artist`. It is not preventing an N+1 on tag loading: `Song.tags` is declared `lazy="subquery"` in `models.py:90`, so accessing `.tags` on the results issues a single batched second query regardless of what the parent search joined to. This was confirmed by enabling SQLAlchemy engine logging: both the original query and a version with the `outerjoin` removed emit exactly 2 SQL statements to load 13 songs and all their tags. Given no filter references tags today, the YAGNI call is to remove it and add it back the day a tag-based filter is actually introduced.
+
+**My fix and side-effect check.** Removed the `outerjoin(song_tags, ...)` from `search_songs` entirely, which eliminates the SQL-level duplication that the legacy `Query.all()` was silently uniquing. In the same change, migrated the query from the legacy `db.session.query(...)` API to the 2.0-style `db.session.execute(select(Song).where(...)).scalars().all()` form as a modernization pass. Because there are no duplicate rows to collapse now, no explicit `.unique()` is required. The unused `song_tags` import was also removed.
+
+Side-effect checks:
+
+1. `pytest tests/test_search.py` passes all 5 pre-existing tests (multi-tag, 1-tag, 0-tag, basic match, empty result).
+2. `pytest tests/` runs cleanly except for the pre-existing `test_streak_increments_on_sunday` failure, which is Issue #1 and tracked separately. No new regressions elsewhere.
+3. Added a new regression test `test_search_does_not_n_plus_1_on_tag_loading` in `tests/test_search.py`. It attaches a `before_cursor_execute` listener to the engine, calls `search_songs("a")` against the fixture (which matches multiple seeded songs), and asserts exactly 2 SELECT statements are emitted (one for songs, one for the batched `lazy="subquery"` tag load). If someone later loses the batching, for example by switching `Song.tags` to `lazy="select"`, this test will fail with the observed statement count and a diff of the extra queries.
+4. Manual endpoint check: `curl "http://127.0.0.1:5000/songs/search?q=Crown+Heights"` still returns `count: 1` with `tags: ["rap", "hip-hop", "boom bap"]` for the 3-tag song, and `?q=Midnight+Drive` still returns the tag-less song once with `tags: []`. The JSON contract of unique songs plus a tag list (empty when absent) is preserved.
