@@ -178,3 +178,26 @@ Side-effect checks:
 3. Confirmed the rest of `rate_song` is untouched: the score-range validation, missing-song and missing-user lookups, and the upsert branch (existing rating gets its score mutated in place; new rating gets added) all behave exactly as before. The fix only adds a new call at the tail.
 4. Endpoint contract is preserved. `POST /songs/<song_id>/rate` still returns the `Rating.to_dict()` at HTTP 201; the notification is a background side effect, not part of the response.
 5. Incidental finding, out of scope for this fix: `add_to_playlist` in the same file mutates `playlist.songs` via the ORM relationship, but the `playlist_entries` join table declares `position` and `added_by` as `NOT NULL`, so the first-time add path raises `IntegrityError` before it can reach its own `create_notification`. That is a separate latent bug in the playlist path, worth filing but not part of Issue #4.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it.** Ran `pytest tests/test_playlists.py`. Two tests failed: `test_playlist_returns_all_songs` (expected 5 songs, got 4; the test comment even calls out `# Bug causes this to return 4`) and `test_playlist_returns_songs_in_order` (expected `["Track 1", ..., "Track 5"]`, got `["Track 1", ..., "Track 4"]`, so "Track 5" is the one missing). The seed data fixture inserts 5 songs at positions 1 through 5 into the playlist, and the last one is dropped from the response.
+
+**How I found the root cause.** I opened `services/playlist_service.py` and read `get_playlist_songs`. The query itself is correct (joins `playlist_entries`, filters by `playlist_id`, orders by `position` ascending, and materializes with `.all()`). The suspicious line is the return statement on line 66:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The `songs[:-1]` slice drops the last element of the list unconditionally. That is what strips "Track 5" from the response and what the failing tests were flagging.
+
+**The root cause.** The comprehension iterates over `songs[:-1]` instead of `songs`. Since Python's `list[:-1]` returns every element except the last, the final song at the highest `position` is always excluded from the response, regardless of how many songs the playlist has (as long as it has at least one, since `[][:-1]` is still `[]`, so the empty-playlist case is unaffected).
+
+**My fix and side-effect check.** Changed `songs[:-1]` to `songs` in the return statement. That is a one-token change and it targets the exact slice identified in the root cause: the comprehension now iterates over every song returned by the query.
+
+Side-effect checks:
+
+1. `pytest tests/test_playlists.py` passes all 3 tests, including `test_playlist_returns_all_songs` and `test_playlist_returns_songs_in_order` which were failing before, plus `test_empty_playlist_returns_empty_list` which was unaffected by the bug (`[][:-1]` is still `[]`) and continues to pass.
+2. `pytest tests/` runs cleanly with 23 passing tests and no failures.
+3. The query and ordering logic are untouched: the `join`, `filter`, and `order_by(asc(position))` still shape the result the same way, so the fix only changes how many elements are serialized, not which ones are selected or how they are ordered.
+4. Endpoint contract is preserved. `GET /playlists/<playlist_id>/songs` still returns `{"songs": [...], "count": N}`, but `count` now correctly reflects the full playlist size instead of `size - 1`.
