@@ -113,11 +113,20 @@ curl "http://127.0.0.1:5000/feed/<nova.id>/listening-now"
 
 Simone appeared in the response with a `listened_at` of 2026-07-01, i.e. yesterday's date, on a request made 2026-07-02. That is the exact behavior the issue describes.
 
-**How I found the root cause.**
+**How I found the root cause.** I traced from `routes/feed.py`'s `listening_now` endpoint to `services/feed_service.get_friends_listening_now`. The interesting piece is the `cutoff` on line 32 and the `RECENT_THRESHOLD` constant on line 13: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` with `RECENT_THRESHOLD = timedelta(hours=24)`. The rest of the function (friends filter, order-by, dedup) reads correctly, so I focused on how the cutoff is computed.
 
-**The root cause.**
+**The root cause.** The cutoff is a fixed 24-hour rolling window: `now - 24h`. That is not the same as "today". At any moment other than exactly midnight, `now - 24h` sits partway through yesterday, so listens from yesterday afternoon and evening (which are calendar-yesterday from the user's perspective) still fall inside the window and surface in the feed. To only show today's listens, the cutoff has to be dynamic: the first moment of the current calendar day. With a fixed `timedelta` there is no way to align the window with the day boundary except by coincidence at midnight.
 
-**My fix and side-effect check.**
+**My fix and side-effect check.** Changed the cutoff from a fixed offset to the first moment of the current UTC calendar day: `datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`. Removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` import.
+
+Side-effect checks:
+
+1. Added a new test file `tests/test_feed.py` with 6 regression tests covering the boundary and adjacent behaviors: `test_feed_excludes_listen_from_yesterday` (a listen 1 second before midnight today must not appear), `test_feed_includes_listen_from_today` (a listen 1 second after midnight today does appear), `test_feed_dedupes_multiple_events_per_friend` (only the most recent today's listen shows), `test_feed_excludes_non_friends`, `test_feed_empty_for_user_with_no_friends`, and `test_feed_raises_for_unknown_user`. Under the old 24-hour rolling window, `test_feed_excludes_listen_from_yesterday` would fail (a 1-second-before-midnight listen is still within 24h), so it doubles as a regression guard against reverting to a fixed threshold.
+2. `pytest tests/test_feed.py` passes all 6 tests.
+3. `pytest tests/` runs cleanly with no new regressions in other suites.
+4. Re-ran the original shell reproduction against a listen back-dated to `midnight_today - 1 second` (unambiguously yesterday). Under the fix, simone does not appear in nova's feed. A companion listen at `midnight_today + 1 second` does appear, confirming the boundary lands where intended.
+5. `get_activity_feed` in the same file is untouched: it does not use the threshold or the cutoff.
+6. Endpoint contract is preserved. `GET /feed/<user_id>/listening-now` still returns `{"feed": [...], "count": N}` with `{friend, song, listened_at}` entries; only the recency filter tightens.
 
 ### Issue #3 — The same song keeps showing up twice in search
 
