@@ -4,6 +4,19 @@
 - The `song_tags` table is a join table that joins songs with multiple tags.
 - The `playlist_entries` table is a join table that adds a `position` column, a song entry in a playlist has its own position, not just insertion order.
 
+`routes/` — thin Flask blueprints, one per resource; each route parses/validates request input, delegates to a service, and shapes the JSON response:
+- `feed.py` — feed endpoints: `/<user_id>/listening-now`, `/<user_id>/activity`.
+- `playlists.py` — create a playlist, get playlist detail, list its songs, add a song.
+- `songs.py` — search songs, get song detail, rate a song, record a listen.
+- `users.py` — get user, get streak, list notifications, mark a notification read.
+
+`services/` — business logic backing the routes; these own the DB reads/writes and enforce rules:
+- `feed_service.py` — builds the "friends listening now" feed (last 24h, deduped) and the broader activity feed.
+- `notification_service.py` — creates `Notification` rows, handles `add_to_playlist` (writes the join row + notifies the song's sharer), and `rate_song` (upserts a `Rating`).
+- `playlist_service.py` — creates playlists and returns playlist metadata / ordered songs / a user's playlists.
+- `search_service.py` — `ILIKE`-based song search over title/artist plus single-song lookup.
+- `streak_service.py` — records `ListeningEvent`s and maintains each user's `listening_streak` / `last_listened_at`.
+
 **Data flow**: 
 1. User viewing their listening streak:
 ```
